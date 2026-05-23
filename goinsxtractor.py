@@ -745,6 +745,357 @@ def run_ghidra_decompile(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dynamic tracing (step 8)
+# Runs the binary for real and intercepts everything it does at runtime.
+#
+# Why this works:
+#   The CPU executes machine code, but every meaningful action the program
+#   takes — opening a file, connecting to a network, spawning a process —
+#   must go through the OS kernel via a system call.  We intercept those calls
+#   with strace (Linux) / dtruss (macOS).  The Go runtime also exposes its
+#   own internal event stream via GODEBUG env vars, giving us GC traces,
+#   scheduler events, and goroutine stacks.  Together these reveal the actual
+#   runtime behaviour of the binary: what code paths ran, what data it touched.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _tool_exists(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def _detect_tracer() -> str | None:
+    """Return the best available syscall tracer for this platform."""
+    if sys.platform.startswith("linux"):
+        if _tool_exists("strace"):
+            return "strace"
+        if _tool_exists("perf"):
+            return "perf"
+    elif sys.platform == "darwin":
+        if _tool_exists("dtruss"):
+            return "dtruss"
+        if _tool_exists("dtrace"):
+            return "dtrace"
+    elif sys.platform == "win32":
+        if _tool_exists("procmon"):
+            return "procmon"
+    return None
+
+
+def _parse_strace(log: str) -> dict:
+    """Parse strace -f output into categorised events."""
+    files_read    = []
+    files_written = []
+    network       = []
+    processes     = []
+    env_vars      = []
+    seen          = set()
+
+    for line in log.splitlines():
+        # openat / open — file access
+        m = re.search(r'openat?\([^,]*,\s*"([^"]+)"[^)]*O_RDONLY', line)
+        if m:
+            f = m.group(1)
+            if f not in seen and not f.startswith("/proc") and not f.startswith("/sys"):
+                files_read.append(f); seen.add(f)
+        m = re.search(r'openat?\([^,]*,\s*"([^"]+)"[^)]*O_(?:WRONLY|RDWR|CREAT)', line)
+        if m:
+            f = m.group(1)
+            key = "w:" + f
+            if key not in seen:
+                files_written.append(f); seen.add(key)
+
+        # connect — outbound network
+        m = re.search(r'connect\(.*sa_family=AF_INET6?.*sin_addr=inet_addr\("([^"]+)"\).*sin6?_port=htons\((\d+)\)', line)
+        if m:
+            entry = f"{m.group(1)}:{m.group(2)}"
+            if entry not in seen:
+                network.append(entry); seen.add(entry)
+        # inet_addr fallback
+        m = re.search(r'connect\(.*"([\d.]+)".*port=(\d+)', line)
+        if m:
+            entry = f"{m.group(1)}:{m.group(2)}"
+            if entry not in seen:
+                network.append(entry); seen.add(entry)
+
+        # execve — subprocess spawning
+        m = re.search(r'execve\("([^"]+)"', line)
+        if m:
+            proc = m.group(1)
+            if proc not in seen:
+                processes.append(proc); seen.add(proc)
+
+        # getenv / environ — env var reads
+        for ev in re.findall(r'"([A-Z][A-Z0-9_]{2,})=', line):
+            if ev not in seen:
+                env_vars.append(ev); seen.add(ev)
+
+    return {
+        "filesRead": files_read,
+        "filesWritten": files_written,
+        "networkConnections": network,
+        "processesSpawned": processes,
+        "envVarsAccessed": env_vars,
+    }
+
+
+def _parse_godebug(output: str) -> dict:
+    """Extract structured data from GODEBUG runtime output."""
+    gc_events   = []
+    sched_lines = []
+    goroutines  = []
+    panics      = []
+
+    for line in output.splitlines():
+        if line.startswith("gc ") and "ms" in line:
+            gc_events.append(line.strip())
+        elif line.startswith("SCHED"):
+            sched_lines.append(line.strip())
+        elif "goroutine " in line and ("running" in line or "waiting" in line):
+            goroutines.append(line.strip())
+        elif "panic:" in line.lower() or "fatal error:" in line.lower():
+            panics.append(line.strip())
+
+    return {
+        "gcEvents": gc_events[:200],
+        "schedEvents": sched_lines[:100],
+        "goroutineSnapshots": goroutines[:100],
+        "panics": panics,
+    }
+
+
+def _get_proc_maps(pid: int) -> list[str]:
+    """Read /proc/<pid>/maps on Linux for live memory layout."""
+    maps_path = Path(f"/proc/{pid}/maps")
+    if not maps_path.exists():
+        return []
+    try:
+        return maps_path.read_text(errors="replace").splitlines()
+    except Exception:
+        return []
+
+
+def run_dynamic_trace(
+    binary_path: Path,
+    out_dir: Path,
+    trace_args: list[str],
+    trace_timeout: int = 30,
+    known_symbols: list[str] | None = None,
+) -> dict:
+    """
+    Execute the binary in a controlled environment and capture everything:
+      - All syscalls (strace / dtruss)
+      - Go runtime internal events (GODEBUG)
+      - stdout / stderr output
+      - Live memory map (/proc/PID/maps on Linux)
+      - Functions actually called (via gdb breakpoints if available)
+
+    Returns a rich result dict.  Writes files into out_dir/trace/.
+    """
+    result = {
+        "success": False,
+        "tracer": None,
+        "exitCode": None,
+        "timedOut": False,
+        "stdout": "",
+        "stderr": "",
+        "godebug": {},
+        "syscallTrace": {},
+        "memoryMap": [],
+        "functionsCalled": [],
+        "error": None,
+    }
+
+    trace_dir = out_dir / "trace"
+    trace_dir.mkdir(exist_ok=True)
+
+    tracer = _detect_tracer()
+    result["tracer"] = tracer
+
+    # ── Environment: activate ALL Go runtime debug streams ───────────────────
+    env = os.environ.copy()
+    env.update({
+        "GOTRACEBACK":       "all",        # full stack trace on any crash
+        "GODEBUG":           "gctrace=1,schedtrace=500,cgocheck=0",
+        "GORACE":            "log_path=stdout",
+        "GOMAXPROCS":        "1",          # deterministic single-threaded execution
+    })
+
+    # ── Build the command ────────────────────────────────────────────────────
+    strace_log = trace_dir / "strace_raw.log"
+    binary_cmd = [str(binary_path.resolve())] + trace_args
+
+    if tracer == "strace":
+        # -f  follow forks
+        # -e  trace every syscall category
+        # -s  print up to 256 chars of string args
+        # -T  show time spent in each syscall
+        # -tt timestamp each call
+        cmd = [
+            "strace", "-f",
+            "-e", "trace=file,network,process,signal,ipc,desc",
+            "-s", "256",
+            "-T", "-tt",
+            "-o", str(strace_log),
+        ] + binary_cmd
+
+    elif tracer == "dtruss":
+        # macOS — requires sudo; warn the user but try anyway
+        cmd = ["dtruss", "-f"] + binary_cmd
+
+    elif tracer == "perf":
+        # Fallback on Linux when strace missing
+        cmd = ["perf", "trace", "--no-syscalls", "--call-graph", "dwarf",
+               "-o", str(strace_log)] + binary_cmd
+    else:
+        # No tracer — run bare with GODEBUG only
+        cmd = binary_cmd
+
+    # ── gdb function-call logging (if gdb is available + we have symbols) ───
+    gdb_log = trace_dir / "gdb_calls.log"
+    gdb_proc = None
+    if _tool_exists("gdb") and known_symbols:
+        # Build a gdb script that logs when each known user function is entered
+        user_syms = [s for s in (known_symbols or [])
+                     if not any(s.startswith(p) for p in (
+                         "runtime.", "reflect.", "sync.", "syscall.",
+                         "internal/", "vendor/"))][:300]
+        gdb_script = trace_dir / "gdb_trace.gdb"
+        gdb_lines = [
+            "set pagination off",
+            "set confirm off",
+            f'set logging file {gdb_log}',
+            "set logging on",
+        ]
+        for sym in user_syms:
+            # Escape parentheses in symbol names
+            safe = sym.replace("(", r"\(").replace(")", r"\)")
+            gdb_lines.append(f'break {safe}')
+            gdb_lines.append(f'commands')
+            gdb_lines.append(f'  silent')
+            gdb_lines.append(f'  printf "CALL: {sym}\\n"')
+            gdb_lines.append(f'  continue')
+            gdb_lines.append(f'end')
+        gdb_lines += ["run", "quit"]
+        gdb_script.write_text("\n".join(gdb_lines), encoding="utf-8")
+
+        gdb_cmd = ["gdb", "-batch", "-x", str(gdb_script),
+                   "--args", str(binary_path.resolve())] + trace_args
+
+    # ── Run the binary ───────────────────────────────────────────────────────
+    combined_stderr = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=trace_timeout,
+            env=env,
+            cwd=str(binary_path.parent),
+        )
+        result["exitCode"]  = proc.returncode
+        result["stdout"]    = proc.stdout[:50_000]
+        result["stderr"]    = proc.stderr[:50_000]
+        combined_stderr     = proc.stderr
+        result["success"]   = True
+
+    except subprocess.TimeoutExpired as exc:
+        result["timedOut"]  = True
+        result["stdout"]    = (exc.stdout or b"")[:50_000].decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")[:50_000]
+        result["stderr"]    = (exc.stderr or b"")[:50_000].decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")[:50_000]
+        combined_stderr     = result["stderr"]
+        result["success"]   = True   # timed-out is still a valid trace run
+        result["exitCode"]  = "timeout"
+
+    except PermissionError:
+        result["error"] = (
+            f"Permission denied executing {binary_path.name}.\n"
+            f"Run: chmod +x {binary_path}"
+        )
+        return result
+
+    except FileNotFoundError:
+        result["error"] = f"Binary not found: {binary_path}"
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    # ── Parse GODEBUG output from stderr ─────────────────────────────────────
+    result["godebug"] = _parse_godebug(combined_stderr)
+
+    # ── Parse strace log ─────────────────────────────────────────────────────
+    if strace_log.exists():
+        raw = strace_log.read_text(errors="replace")
+        result["syscallTrace"] = _parse_strace(raw)
+        # Keep a trimmed copy of the raw strace
+        (trace_dir / "strace.log").write_text(raw[:500_000], encoding="utf-8")
+    elif tracer == "strace":
+        # strace writes to stderr when -o is not used by dtruss path
+        result["syscallTrace"] = _parse_strace(combined_stderr)
+
+    # ── gdb function call log ─────────────────────────────────────────────────
+    if gdb_log.exists():
+        calls_raw = gdb_log.read_text(errors="replace")
+        calls = [l[6:].strip() for l in calls_raw.splitlines() if l.startswith("CALL: ")]
+        result["functionsCalled"] = list(dict.fromkeys(calls))
+
+    # ── Write output files ───────────────────────────────────────────────────
+    (trace_dir / "stdout.txt").write_text(result["stdout"], encoding="utf-8")
+    (trace_dir / "stderr_godebug.txt").write_text(result["stderr"], encoding="utf-8")
+
+    sc = result["syscallTrace"]
+    if sc:
+        _write(trace_dir / "files_read.txt",
+               sc.get("filesRead", []),    "FILES READ")
+        _write(trace_dir / "files_written.txt",
+               sc.get("filesWritten", []), "FILES WRITTEN")
+        _write(trace_dir / "network.txt",
+               sc.get("networkConnections", []), "NETWORK CONNECTIONS")
+        _write(trace_dir / "processes.txt",
+               sc.get("processesSpawned", []), "PROCESSES SPAWNED")
+        _write(trace_dir / "env_vars.txt",
+               sc.get("envVarsAccessed", []), "ENV VARS ACCESSED")
+
+    if result["functionsCalled"]:
+        _write(trace_dir / "functions_called.txt",
+               result["functionsCalled"], "FUNCTIONS CALLED AT RUNTIME")
+
+    gd = result["godebug"]
+    if gd.get("gcEvents") or gd.get("goroutineSnapshots"):
+        lines = []
+        if gd["gcEvents"]:
+            lines += ["── GC Events ──────────────────────────────────────"] + gd["gcEvents"]
+        if gd["schedEvents"]:
+            lines += ["", "── Scheduler Events ───────────────────────────────"] + gd["schedEvents"]
+        if gd["goroutineSnapshots"]:
+            lines += ["", "── Goroutine Snapshots ────────────────────────────"] + gd["goroutineSnapshots"]
+        if gd["panics"]:
+            lines += ["", "── Panics / Fatal Errors ──────────────────────────"] + gd["panics"]
+        _write(trace_dir / "runtime_events.txt", lines, "GO RUNTIME EVENTS (GODEBUG)")
+
+    # ── Summary file ─────────────────────────────────────────────────────────
+    summary = [
+        f"Binary      : {binary_path.name}",
+        f"Tracer      : {tracer or 'none (GODEBUG only)'}",
+        f"Exit code   : {result['exitCode']}",
+        f"Timed out   : {result['timedOut']} (limit: {trace_timeout}s)",
+        "",
+        f"Files read     : {len(sc.get('filesRead', []))}",
+        f"Files written  : {len(sc.get('filesWritten', []))}",
+        f"Network conns  : {len(sc.get('networkConnections', []))}",
+        f"Processes      : {len(sc.get('processesSpawned', []))}",
+        f"Env vars read  : {len(sc.get('envVarsAccessed', []))}",
+        f"Functions hit  : {len(result['functionsCalled'])}",
+        f"GC events      : {len(gd.get('gcEvents', []))}",
+        f"Goroutines     : {len(gd.get('goroutineSnapshots', []))}",
+        f"Panics         : {len(gd.get('panics', []))}",
+    ]
+    _write(trace_dir / "summary.txt", summary, "DYNAMIC TRACE SUMMARY")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Banner
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -780,6 +1131,9 @@ def extract(
     skip_stdlib: bool = True,
     max_funcs: int = 0,
     timeout: int = 600,
+    use_trace: bool = False,
+    trace_args: list[str] | None = None,
+    trace_timeout: int = 30,
 ) -> int:
     banner()
 
@@ -834,7 +1188,7 @@ def extract(
         "sha256": hashlib.sha256(data).hexdigest(),
     }
 
-    total_steps = 7 if use_ghidra else 6
+    total_steps = 6 + (1 if use_ghidra else 0) + (1 if use_trace else 0)
 
     # ── 1. Binary metadata ───────────────────────────────────────────────────
     print(f"  [{bold(f'1/{total_steps}')}] Parsing binary metadata…", end=" ", flush=True)
@@ -940,6 +1294,50 @@ def extract(
             for line in (ghidra_result.get("error") or "unknown error").splitlines()[-8:]:
                 print(f"           {dim(line)}")
 
+    # ── 8. Dynamic trace ─────────────────────────────────────────────────────
+    trace_result = None
+    if use_trace:
+        step_n = 7 + (1 if use_ghidra else 0)
+        tracer = _detect_tracer()
+        tracer_label = tracer or dim("none — GODEBUG only")
+        print(f"\n  [{bold(f'{step_n}/{total_steps}')}] {yellow('Dynamic trace')}  "
+              f"[tracer: {tracer_label}]")
+        print(f"         {yellow('⚠  WARNING:')} This EXECUTES the binary on your machine.")
+        print(f"         Do NOT use on untrusted / malware samples without a sandbox.")
+        print(f"         Timeout: {trace_timeout}s")
+        if trace_args:
+            print(f"         Args: {' '.join(trace_args)}")
+        print()
+
+        trace_result = run_dynamic_trace(
+            binary_path=path,
+            out_dir=out_dir,
+            trace_args=trace_args or [],
+            trace_timeout=trace_timeout,
+            known_symbols=all_syms,
+        )
+        report["dynamicTrace"] = trace_result
+
+        if trace_result["success"]:
+            sc = trace_result.get("syscallTrace", {})
+            gd = trace_result.get("godebug", {})
+            fc = trace_result.get("functionsCalled", [])
+            timed = " (timed out)" if trace_result["timedOut"] else ""
+            print(f"         {green('✓')} Trace complete{timed}  "
+                  f"exit={trace_result['exitCode']}")
+            print(f"         Files read   : {len(sc.get('filesRead', []))}")
+            print(f"         Files written: {len(sc.get('filesWritten', []))}")
+            print(f"         Network conns: {len(sc.get('networkConnections', []))}")
+            print(f"         Procs spawned: {len(sc.get('processesSpawned', []))}")
+            print(f"         Funcs called : {len(fc)}  (via gdb)")
+            print(f"         GC events    : {len(gd.get('gcEvents', []))}")
+            print(f"         Goroutines   : {len(gd.get('goroutineSnapshots', []))}")
+            if gd.get("panics"):
+                for p in gd["panics"][:3]:
+                    print(f"         {red('PANIC:')} {p}")
+        else:
+            print(f"         {red('✗')} Trace failed: {trace_result.get('error', 'unknown')}")
+
     # ── Write static output files ────────────────────────────────────────────
     print()
     print(bold("  Writing output…"))
@@ -999,12 +1397,33 @@ def extract(
             print(f"    {magenta('decompiled/'):<26} {n} individual .c files (one per function)")
         else:
             print(f"    {red('decompiled.c'):<26} {red('FAILED — see error above')}")
+
+    if use_trace and trace_result:
+        sc = trace_result.get("syscallTrace", {})
+        if trace_result["success"]:
+            print(f"    {yellow('trace/summary.txt'):<26} dynamic trace summary")
+            print(f"    {yellow('trace/files_read.txt'):<26} {len(sc.get('filesRead', []))} files read")
+            print(f"    {yellow('trace/files_written.txt'):<26} {len(sc.get('filesWritten', []))} files written")
+            print(f"    {yellow('trace/network.txt'):<26} {len(sc.get('networkConnections', []))} network connections")
+            print(f"    {yellow('trace/functions_called.txt'):<26} {len(trace_result.get('functionsCalled', []))} funcs hit at runtime")
+            print(f"    {yellow('trace/runtime_events.txt'):<26} GC + goroutine events")
+            print(f"    {yellow('trace/stdout.txt'):<26} binary stdout output")
+            if (out_dir / "trace" / "strace.log").exists():
+                print(f"    {yellow('trace/strace.log'):<26} raw syscall log")
+            if (out_dir / "trace" / "gdb_calls.log").exists():
+                print(f"    {yellow('trace/gdb_calls.log'):<26} raw gdb breakpoint log")
+        else:
+            print(f"    {red('trace/'):<26} {red('FAILED — see error above')}")
     print()
 
     # ── Tips ─────────────────────────────────────────────────────────────────
+    tips = []
     if not use_ghidra:
-        print(dim("  Tip: add --ghidra to also decompile every function to C pseudocode via Ghidra."))
-        print(dim("       Requires Ghidra 10+ installed. https://ghidra-sre.org/"))
+        tips.append("--ghidra       decompile every function to C pseudocode (needs Ghidra 10+)")
+    if not use_trace:
+        tips.append("--trace        run the binary live and intercept all syscalls + runtime events")
+    if tips:
+        print(dim("  More power: " + "  |  ".join(tips)))
         print()
 
     if meta["isStripped"]:
@@ -1047,27 +1466,40 @@ ghidra decompilation notes:
     p.add_argument("binary",      help="Path to the Go executable to analyse")
     p.add_argument("output_dir",  nargs="?", default=None,
                    help="Output directory (default: <binary>_extracted/)")
-    p.add_argument("--ghidra",    action="store_true",
-                   help="Run Ghidra headless decompilation (step 7)")
-    p.add_argument("--ghidra-home", metavar="PATH", default=None,
+
+    g = p.add_argument_group("Ghidra decompilation (step 7)")
+    g.add_argument("--ghidra",    action="store_true",
+                   help="Run Ghidra headless decompilation")
+    g.add_argument("--ghidra-home", metavar="PATH", default=None,
                    help="Path to Ghidra installation (overrides GHIDRA_HOME env var)")
-    p.add_argument("--no-skip-stdlib", action="store_true",
+    g.add_argument("--no-skip-stdlib", action="store_true",
                    help="Include Go stdlib/runtime functions in Ghidra output (slow, very large)")
-    p.add_argument("--max-funcs", type=int, default=0, metavar="N",
-                   help="Limit Ghidra decompilation to the first N user functions (0 = unlimited)")
-    p.add_argument("--timeout",   type=int, default=600, metavar="SECS",
+    g.add_argument("--max-funcs", type=int, default=0, metavar="N",
+                   help="Limit Ghidra to first N user functions (0 = unlimited)")
+    g.add_argument("--timeout",   type=int, default=600, metavar="SECS",
                    help="Ghidra analysis timeout in seconds (default: 600)")
+
+    t = p.add_argument_group("Dynamic trace — execute the binary and intercept everything (step 8)")
+    t.add_argument("--trace",     action="store_true",
+                   help="Run the binary live and capture syscalls, runtime events, function calls")
+    t.add_argument("--trace-timeout", type=int, default=30, metavar="SECS",
+                   help="Kill the binary after N seconds (default: 30)")
+    t.add_argument("--trace-args", nargs=argparse.REMAINDER, default=[], metavar="ARG",
+                   help="Arguments to pass to the binary (put after --)")
 
     args = p.parse_args()
 
     return extract(
-        binary_path   = args.binary,
-        output_dir    = args.output_dir,
-        use_ghidra    = args.ghidra,
+        binary_path     = args.binary,
+        output_dir      = args.output_dir,
+        use_ghidra      = args.ghidra,
         ghidra_home_arg = args.ghidra_home,
-        skip_stdlib   = not args.no_skip_stdlib,
-        max_funcs     = args.max_funcs,
-        timeout       = args.timeout,
+        skip_stdlib     = not args.no_skip_stdlib,
+        max_funcs       = args.max_funcs,
+        timeout         = args.timeout,
+        use_trace       = args.trace,
+        trace_args      = args.trace_args or [],
+        trace_timeout   = args.trace_timeout,
     )
 
 
